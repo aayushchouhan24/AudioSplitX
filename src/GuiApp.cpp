@@ -9,6 +9,8 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,6 +39,9 @@ enum class HitAction {
     StartStop,
     SourceSelect,
     OutputToggle,
+    DelayDec,
+    DelayInc,
+    DelayValue,
 };
 
 struct HitZone {
@@ -93,12 +98,19 @@ private:
     void drawSourcePanel(Graphics& g, const RectF& area);
     void drawOutputPanel(Graphics& g, const RectF& area);
     void drawEndpointRow(Graphics& g, const RectF& row, const asx::AudioEndpoint& endpoint, bool active, bool disabled,
-        const wchar_t* subtext, HitAction action, size_t index);
-    void drawButton(Graphics& g, const RectF& r, const wchar_t* label, const Color& fill, const Color& border, const Color& text);
+        const std::wstring& subtext, HitAction action, size_t index);
+    void drawButton(Graphics& g, const RectF& r, const wchar_t* label, const Color& fill, const Color& border, const Color& text,
+        bool hovered = false);
     void drawRound(Graphics& g, const RectF& r, float radius, const Color& fill, const Color& border);
     void drawText(Graphics& g, const std::wstring& text, const RectF& r, float size, const Color& color,
         int style = FontStyleRegular, StringAlignment align = StringAlignmentNear, StringAlignment lineAlign = StringAlignmentNear);
     void addZone(const RectF& rect, HitAction action, size_t index = 0);
+    bool isHovered(HitAction action, size_t index = 0) const;
+    void setHoveredZone(const HitZone* zone);
+    void adjustDelayMs(size_t index, double deltaMs);
+    void beginDelayEdit(size_t index);
+    void commitDelayEdit();
+    void cancelDelayEdit();
     bool hitTest(float x, float y, HitZone& zone) const;
     LRESULT hitTestChrome(int x, int y) const;
 
@@ -108,6 +120,7 @@ private:
     asx::DeviceEnumerator enumerator_;
     std::vector<asx::AudioEndpoint> endpoints_;
     std::vector<bool> outputSelected_;
+    std::vector<double> outputDelayMs_;
     size_t sourceIndex_ = 0;
     std::vector<HitZone> zones_;
     std::unique_ptr<asx::AudioEngine> engine_;
@@ -115,6 +128,12 @@ private:
     std::wstring status_ = L"Choose source and outputs.";
     HICON appIconLarge_ = nullptr;
     HICON appIconSmall_ = nullptr;
+    bool hoverValid_ = false;
+    HitAction hoverAction_ = HitAction::Refresh;
+    size_t hoverIndex_ = 0;
+    bool mouseTracking_ = false;
+    size_t editingDelayIndex_ = SIZE_MAX;
+    std::wstring delayEditText_;
 };
 
 int GuiApp::run(HINSTANCE instance, int show)
@@ -259,7 +278,16 @@ LRESULT GuiApp::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
         HitZone hit;
         const float x = static_cast<float>(GET_X_LPARAM(lParam));
         const float y = static_cast<float>(GET_Y_LPARAM(lParam));
-        if (!hitTest(x, y, hit)) {
+        const bool hasHit = hitTest(x, y, hit);
+
+        if (editingDelayIndex_ != SIZE_MAX) {
+            if (!hasHit || hit.action != HitAction::DelayValue || hit.index != editingDelayIndex_) {
+                commitDelayEdit();
+            }
+        }
+
+        if (!hasHit) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         }
 
@@ -296,11 +324,109 @@ LRESULT GuiApp::handleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
                 status_ = outputSelected_[hit.index] ? L"Output enabled." : L"Output disabled.";
             }
             break;
+        case HitAction::DelayDec:
+            adjustDelayMs(hit.index, -5.0);
+            break;
+        case HitAction::DelayInc:
+            adjustDelayMs(hit.index, 5.0);
+            break;
+        case HitAction::DelayValue:
+            if (!routing_) {
+                beginDelayEdit(hit.index);
+            }
+            break;
         }
 
+        SetFocus(hwnd_);
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     }
+
+    case WM_MOUSEMOVE: {
+        if (!mouseTracking_) {
+            TRACKMOUSEEVENT tme {};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd_;
+            TrackMouseEvent(&tme);
+            mouseTracking_ = true;
+        }
+
+        HitZone hit;
+        const float x = static_cast<float>(GET_X_LPARAM(lParam));
+        const float y = static_cast<float>(GET_Y_LPARAM(lParam));
+        if (hitTest(x, y, hit)) {
+            setHoveredZone(&hit);
+        } else {
+            setHoveredZone(nullptr);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        mouseTracking_ = false;
+        setHoveredZone(nullptr);
+        return 0;
+
+    case WM_CHAR:
+        if (editingDelayIndex_ != SIZE_MAX && !routing_) {
+            if (wParam >= L'0' && wParam <= L'9') {
+                if (delayEditText_.size() < 4) {
+                    if (delayEditText_ == L"0") {
+                        delayEditText_.clear();
+                    }
+                    delayEditText_.push_back(static_cast<wchar_t>(wParam));
+                }
+                status_ = L"Editing output delay (ms).";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+
+            if (wParam == VK_BACK) {
+                if (!delayEditText_.empty()) {
+                    delayEditText_.pop_back();
+                }
+                if (delayEditText_.empty()) {
+                    delayEditText_ = L"0";
+                }
+                status_ = L"Editing output delay (ms).";
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+
+            if (wParam == VK_RETURN) {
+                commitDelayEdit();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+
+            if (wParam == 27) {
+                cancelDelayEdit();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+        }
+        return DefWindowProcW(hwnd_, msg, wParam, lParam);
+
+    case WM_KEYDOWN:
+        if (editingDelayIndex_ != SIZE_MAX && !routing_) {
+            if (wParam == VK_UP) {
+                adjustDelayMs(editingDelayIndex_, 1.0);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wParam == VK_DOWN) {
+                adjustDelayMs(editingDelayIndex_, -1.0);
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+            if (wParam == VK_ESCAPE) {
+                cancelDelayEdit();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return 0;
+            }
+        }
+        return DefWindowProcW(hwnd_, msg, wParam, lParam);
 
     case WM_PAINT:
         paint();
@@ -329,6 +455,7 @@ void GuiApp::refreshEndpoints()
     try {
         endpoints_ = enumerator_.listRenderEndpoints();
         outputSelected_.assign(endpoints_.size(), false);
+        outputDelayMs_.assign(endpoints_.size(), 0.0);
         sourceIndex_ = 0;
 
         for (size_t i = 0; i < endpoints_.size(); ++i) {
@@ -368,9 +495,11 @@ void GuiApp::startEngine()
     }
 
     std::vector<asx::AudioEndpoint> outputs;
+    std::vector<double> outputManualDelayMs;
     for (size_t i = 0; i < endpoints_.size(); ++i) {
         if (i != sourceIndex_ && i < outputSelected_.size() && outputSelected_[i]) {
             outputs.push_back(endpoints_[i]);
+            outputManualDelayMs.push_back(i < outputDelayMs_.size() ? outputDelayMs_[i] : 0.0);
         }
     }
 
@@ -383,6 +512,7 @@ void GuiApp::startEngine()
         asx::AudioEngineConfig config;
         config.source = endpoints_[sourceIndex_];
         config.outputs = std::move(outputs);
+        config.outputManualDelayMs = std::move(outputManualDelayMs);
         config.preferExclusive = true;
         config.consoleMeter = false;
         config.endpointBufferMs = 10.0;
@@ -477,14 +607,20 @@ void GuiApp::drawTitleBar(Graphics& g, const RectF& area)
 
     const RectF refresh(area.GetRight() - 264.0f, 12.0f, 92.0f, 32.0f);
     const RectF start(area.GetRight() - 162.0f, 12.0f, 92.0f, 32.0f);
-    drawButton(g, refresh, L"Refresh", c_.row, c_.stroke, c_.text);
+    drawButton(g, refresh, L"Refresh", c_.row, c_.stroke, c_.text, isHovered(HitAction::Refresh));
     drawButton(g, start, routing_ ? L"Stop" : L"Start", routing_ ? Color(255, 58, 24, 28) : Color(255, 18, 70, 50),
-        routing_ ? c_.red : c_.green, c_.text);
+        routing_ ? c_.red : c_.green, c_.text, isHovered(HitAction::StartStop));
     addZone(refresh, HitAction::Refresh);
     addZone(start, HitAction::StartStop);
 
     const RectF min(area.GetRight() - 64.0f, 0.0f, 32.0f, 32.0f);
     const RectF close(area.GetRight() - 32.0f, 0.0f, 32.0f, 32.0f);
+    if (isHovered(HitAction::Minimize)) {
+        drawRound(g, min, 6.0f, c_.rowHover, c_.stroke);
+    }
+    if (isHovered(HitAction::Close)) {
+        drawRound(g, close, 6.0f, Color(255, 70, 28, 32), c_.red);
+    }
     drawText(g, L"_", min, 14.0f, c_.muted, FontStyleBold, StringAlignmentCenter, StringAlignmentCenter);
     drawText(g, L"x", close, 13.0f, c_.muted, FontStyleBold, StringAlignmentCenter, StringAlignmentCenter);
     addZone(min, HitAction::Minimize);
@@ -513,7 +649,7 @@ void GuiApp::drawSourcePanel(Graphics& g, const RectF& area)
     for (size_t i = 0; i < endpoints_.size() && y + rowH <= bottom; ++i) {
         const bool active = i == sourceIndex_;
         std::wstring sub = endpoints_[i].isDefault ? L"default device" : L"available endpoint";
-        drawEndpointRow(g, RectF(area.X + 14.0f, y, area.Width - 28.0f, rowH - 8.0f), endpoints_[i], active, routing_, sub.c_str(),
+        drawEndpointRow(g, RectF(area.X + 14.0f, y, area.Width - 28.0f, rowH - 8.0f), endpoints_[i], active, routing_, sub,
             HitAction::SourceSelect, i);
         y += rowH;
     }
@@ -531,7 +667,10 @@ void GuiApp::drawOutputPanel(Graphics& g, const RectF& area)
     for (size_t i = 0; i < endpoints_.size() && y + rowH <= bottom; ++i) {
         const bool isSource = i == sourceIndex_;
         const bool selected = i < outputSelected_.size() && outputSelected_[i];
-        const wchar_t* sub = isSource ? L"source - cannot output here" : (selected ? L"enabled output" : L"disabled");
+        std::wstring sub = isSource ? L"source - cannot output here" : (selected ? L"enabled output" : L"disabled");
+        if (!isSource && i < outputDelayMs_.size()) {
+            sub += L" | delay " + std::to_wstring(static_cast<int>(std::lround(outputDelayMs_[i]))) + L" ms";
+        }
         drawEndpointRow(g, RectF(area.X + 14.0f, y, area.Width - 28.0f, rowH - 8.0f), endpoints_[i], selected, routing_ || isSource, sub,
             HitAction::OutputToggle, i);
         y += rowH;
@@ -539,7 +678,7 @@ void GuiApp::drawOutputPanel(Graphics& g, const RectF& area)
 }
 
 void GuiApp::drawEndpointRow(Graphics& g, const RectF& row, const asx::AudioEndpoint& endpoint, bool active, bool disabled,
-    const wchar_t* subtext, HitAction action, size_t index)
+    const std::wstring& subtext, HitAction action, size_t index)
 {
     const Color border = active ? (action == HitAction::SourceSelect ? c_.accent : c_.green) : c_.stroke;
     const Color fill = active ? Color(255, 25, 30, 32) : c_.row;
@@ -550,26 +689,67 @@ void GuiApp::drawEndpointRow(Graphics& g, const RectF& row, const asx::AudioEndp
     g.FillEllipse(&dotBrush, dot);
 
     const size_t titleChars = static_cast<size_t>(std::max(20.0f, row.Width / 10.0f));
-    drawText(g, compact(endpoint.name, titleChars), RectF(row.X + 42.0f, row.Y + 8.0f, row.Width - 98.0f, 18.0f), 11.5f,
+    drawText(g, compact(endpoint.name, titleChars), RectF(row.X + 42.0f, row.Y + 8.0f, row.Width - 210.0f, 18.0f), 11.5f,
         disabled && !active ? c_.muted : c_.text, FontStyleBold);
-    drawText(g, subtext, RectF(row.X + 42.0f, row.Y + 27.0f, row.Width - 98.0f, 14.0f), 8.5f, c_.muted);
-
-    if (action == HitAction::OutputToggle && index != sourceIndex_) {
-        const RectF toggle(row.GetRight() - 48.0f, row.Y + 10.0f, 34.0f, 24.0f);
-        drawRound(g, toggle, 12.0f, active ? Color(255, 24, 78, 56) : Color(255, 32, 37, 46), active ? c_.green : c_.stroke);
-        SolidBrush knob(active ? c_.green : c_.dim);
-        g.FillEllipse(&knob, active ? RectF(toggle.GetRight() - 20.0f, toggle.Y + 5.0f, 14.0f, 14.0f)
-                                    : RectF(toggle.X + 6.0f, toggle.Y + 5.0f, 14.0f, 14.0f));
-    }
+    drawText(g, subtext, RectF(row.X + 42.0f, row.Y + 27.0f, row.Width - 210.0f, 14.0f), 8.5f, c_.muted);
 
     if (!disabled || action == HitAction::SourceSelect) {
         addZone(row, action, index);
     }
+
+    if (action == HitAction::OutputToggle && index != sourceIndex_) {
+        const int delayMs = (index < outputDelayMs_.size()) ? static_cast<int>(std::lround(outputDelayMs_[index])) : 0;
+        const RectF toggle(row.GetRight() - 48.0f, row.Y + 10.0f, 34.0f, 24.0f);
+        const RectF incBtn(toggle.X - 30.0f, row.Y + 10.0f, 24.0f, 24.0f);
+        const RectF delayValue(incBtn.X - 90.0f, row.Y + 10.0f, 84.0f, 24.0f);
+        const RectF decBtn(delayValue.X - 30.0f, row.Y + 10.0f, 24.0f, 24.0f);
+
+        const bool decHover = isHovered(HitAction::DelayDec, index);
+        const bool incHover = isHovered(HitAction::DelayInc, index);
+        const bool valueHover = isHovered(HitAction::DelayValue, index);
+        const bool valueActive = editingDelayIndex_ == index;
+
+        std::wstring delayLabel = std::to_wstring(delayMs) + L" ms";
+        if (valueActive) {
+            delayLabel = (delayEditText_.empty() ? L"0" : delayEditText_) + L" ms";
+        }
+
+        drawButton(g, decBtn, L"-", c_.row, c_.stroke, disabled ? c_.dim : c_.text, decHover);
+        drawRound(g, delayValue, 6.0f, valueActive ? Color(255, 22, 28, 35) : Color(255, 13, 16, 20),
+            valueActive ? c_.accent : (valueHover ? c_.muted : c_.stroke));
+        drawText(g, delayLabel, delayValue, 9.0f, disabled ? c_.dim : c_.text,
+            FontStyleBold, StringAlignmentCenter, StringAlignmentCenter);
+        drawButton(g, incBtn, L"+", c_.row, c_.stroke, disabled ? c_.dim : c_.text, incHover);
+
+        const bool toggleHover = isHovered(HitAction::OutputToggle, index);
+        drawRound(g, toggle, 12.0f,
+            active ? (toggleHover ? Color(255, 34, 95, 68) : Color(255, 24, 78, 56))
+                   : (toggleHover ? Color(255, 40, 45, 56) : Color(255, 32, 37, 46)),
+            active ? c_.green : c_.stroke);
+        SolidBrush knob(active ? c_.green : c_.dim);
+        g.FillEllipse(&knob, active ? RectF(toggle.GetRight() - 20.0f, toggle.Y + 5.0f, 14.0f, 14.0f)
+                                    : RectF(toggle.X + 6.0f, toggle.Y + 5.0f, 14.0f, 14.0f));
+
+        if (!disabled) {
+            addZone(decBtn, HitAction::DelayDec, index);
+            addZone(delayValue, HitAction::DelayValue, index);
+            addZone(incBtn, HitAction::DelayInc, index);
+        }
+    }
 }
 
-void GuiApp::drawButton(Graphics& g, const RectF& r, const wchar_t* label, const Color& fill, const Color& border, const Color& text)
+void GuiApp::drawButton(Graphics& g, const RectF& r, const wchar_t* label, const Color& fill, const Color& border, const Color& text,
+    bool hovered)
 {
-    drawRound(g, r, 7.0f, fill, border);
+    const Color hoverFill = Color(fill.GetA(),
+        static_cast<BYTE>(std::min(255, fill.GetR() + 10)),
+        static_cast<BYTE>(std::min(255, fill.GetG() + 10)),
+        static_cast<BYTE>(std::min(255, fill.GetB() + 10)));
+    const Color hoverBorder = Color(border.GetA(),
+        static_cast<BYTE>(std::min(255, border.GetR() + 16)),
+        static_cast<BYTE>(std::min(255, border.GetG() + 16)),
+        static_cast<BYTE>(std::min(255, border.GetB() + 16)));
+    drawRound(g, r, 7.0f, hovered ? hoverFill : fill, hovered ? hoverBorder : border);
     drawText(g, label, r, 9.5f, text, FontStyleBold, StringAlignmentCenter, StringAlignmentCenter);
 }
 
@@ -606,6 +786,78 @@ void GuiApp::drawText(Graphics& g, const std::wstring& text, const RectF& r, flo
 void GuiApp::addZone(const RectF& rect, HitAction action, size_t index)
 {
     zones_.push_back(HitZone { rect, action, index });
+}
+
+bool GuiApp::isHovered(HitAction action, size_t index) const
+{
+    return hoverValid_ && hoverAction_ == action && hoverIndex_ == index;
+}
+
+void GuiApp::setHoveredZone(const HitZone* zone)
+{
+    const bool newValid = zone != nullptr;
+    const HitAction newAction = newValid ? zone->action : HitAction::Refresh;
+    const size_t newIndex = newValid ? zone->index : 0;
+
+    if (hoverValid_ != newValid || hoverAction_ != newAction || hoverIndex_ != newIndex) {
+        hoverValid_ = newValid;
+        hoverAction_ = newAction;
+        hoverIndex_ = newIndex;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+void GuiApp::adjustDelayMs(size_t index, double deltaMs)
+{
+    if (routing_ || index >= outputDelayMs_.size() || index == sourceIndex_) {
+        return;
+    }
+
+    outputDelayMs_[index] = std::clamp(outputDelayMs_[index] + deltaMs, 0.0, 5000.0);
+    if (editingDelayIndex_ == index) {
+        delayEditText_ = std::to_wstring(static_cast<int>(std::lround(outputDelayMs_[index])));
+    }
+    status_ = L"Output delay updated.";
+}
+
+void GuiApp::beginDelayEdit(size_t index)
+{
+    if (routing_ || index >= outputDelayMs_.size() || index == sourceIndex_) {
+        return;
+    }
+
+    editingDelayIndex_ = index;
+    delayEditText_ = std::to_wstring(static_cast<int>(std::lround(outputDelayMs_[index])));
+    status_ = L"Editing output delay (ms). Type number, Enter to apply, Esc to cancel.";
+}
+
+void GuiApp::commitDelayEdit()
+{
+    if (editingDelayIndex_ == SIZE_MAX || editingDelayIndex_ >= outputDelayMs_.size()) {
+        editingDelayIndex_ = SIZE_MAX;
+        delayEditText_.clear();
+        return;
+    }
+
+    int value = 0;
+    try {
+        value = std::stoi(delayEditText_.empty() ? std::wstring(L"0") : delayEditText_);
+    } catch (...) {
+        value = static_cast<int>(std::lround(outputDelayMs_[editingDelayIndex_]));
+    }
+
+    outputDelayMs_[editingDelayIndex_] = std::clamp(static_cast<double>(value), 0.0, 5000.0);
+    delayEditText_ = std::to_wstring(static_cast<int>(std::lround(outputDelayMs_[editingDelayIndex_])));
+    status_ = L"Output delay updated.";
+    editingDelayIndex_ = SIZE_MAX;
+    delayEditText_.clear();
+}
+
+void GuiApp::cancelDelayEdit()
+{
+    editingDelayIndex_ = SIZE_MAX;
+    delayEditText_.clear();
+    status_ = L"Delay edit canceled.";
 }
 
 bool GuiApp::hitTest(float x, float y, HitZone& zone) const

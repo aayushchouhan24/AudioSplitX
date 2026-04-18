@@ -15,6 +15,7 @@ namespace asx {
 struct AudioEngineConfig {
     AudioEndpoint source;
     std::vector<AudioEndpoint> outputs;
+    std::vector<double> outputManualDelayMs;
     bool preferExclusive = true;
     double captureRingMs = 750.0;
     double outputRingMs = 750.0;

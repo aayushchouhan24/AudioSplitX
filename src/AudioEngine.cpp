@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -108,9 +109,14 @@ void AudioEngine::configureOutputTargets()
         static_cast<size_t>((static_cast<double>(sourceFormat_.sampleRate) * config_.endpointBufferMs) / 1000.0),
         sourceFormat_.sampleRate / 250);
 
-    for (auto& output : outputs_) {
+    for (size_t i = 0; i < outputs_.size(); ++i) {
+        auto& output = outputs_[i];
         const size_t latency = output->streamLatencySourceFrames();
-        const size_t target = safetyFrames + (maxLatencyFrames > latency ? maxLatencyFrames - latency : 0);
+        const double manualDelayMs = (i < config_.outputManualDelayMs.size()) ? std::max(0.0, config_.outputManualDelayMs[i]) : 0.0;
+        const size_t manualDelayFrames = static_cast<size_t>(
+            std::llround((manualDelayMs * static_cast<double>(sourceFormat_.sampleRate)) / 1000.0));
+
+        const size_t target = safetyFrames + (maxLatencyFrames > latency ? maxLatencyFrames - latency : 0) + manualDelayFrames;
         output->setTargetFillFrames(target);
         output->seedSilence(target);
     }
