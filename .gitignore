@@ -1,0 +1,61 @@
+# Build directories
+/build/
+/build-*/
+/build-installer/
+/.wix/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+compile_commands.json
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.ipch
+*.pdb
+*.obj
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.tlog
+*.lastbuildstate
+*.recipe
+*.vcxproj.user
+
+# MSBuild output folders
+x64/
+Win32/
+Debug/
+Release/
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.bak
+*~
+
+# Packaging artifacts
+*.msi
+*.wixobj
+*.wixpdb
+*.wixlib
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
